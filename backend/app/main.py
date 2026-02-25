@@ -279,101 +279,114 @@ def shipments(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-from datetime import datetime
 from fastapi import Query
+import psycopg2.extras
 
 @app.get("/alerts")
 def alerts(
     schema: str = Query(default=DB_SCHEMA_DEFAULT),
-    # thresholds you can tweak in UI later
-    conveyor_stale_seconds: int = Query(default=30),   # alert if no conveyor events in last 30s
-    conveyor_slow_duration: float = Query(default=3.0),# alert if avg duration_sec > 3s (last 2 min)
-    window_minutes: int = Query(default=2),            # lookback window for avg checks
+    conveyor_stale_seconds: int = Query(default=30),
+    conveyor_slow_duration: float = Query(default=3.0),
+    window_minutes: int = Query(default=2),
 ):
     """
-    Returns computed "active alerts" (no database writes required).
-    Works even if you haven't built alert tables yet.
+    Computed 'active alerts' (no DB writes required).
+    Includes identifiers (conveyor_id/part_id/source_pi) so UI can highlight & focus.
     """
     try:
         conn = get_conn()
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
-        # 1) Conveyor stale: no recent events
+        active_alerts = []
+
+        # Latest conveyor row (for identifiers)
         cur.execute(
             f"""
-            SELECT MAX(event_time) AS last_event_time
+            SELECT id, conveyor_id, part_id, source_pi, duration_sec, speed, event_time
+            FROM "{schema}".raw_conveyor
+            ORDER BY event_time DESC
+            LIMIT 1
+            """
+        )
+        latest = cur.fetchone()
+
+        # 1) Conveyor stale (no recent events)
+        cur.execute(
+            f"""
+            SELECT EXTRACT(EPOCH FROM (NOW() - MAX(event_time))) AS seconds_stale
             FROM "{schema}".raw_conveyor
             """
         )
-        last_event = cur.fetchone()["last_event_time"]
+        seconds_stale = cur.fetchone()["seconds_stale"]
 
-        active_alerts = []
-        now = datetime.utcnow()
-
-        if last_event is None:
+        if seconds_stale is None:
+            # no rows at all
             active_alerts.append({
                 "type": "conveyor_no_data",
                 "severity": "critical",
                 "title": "No conveyor data",
                 "message": "raw_conveyor has no rows yet.",
                 "source": "raw_conveyor",
+                "event_time": None,
+                "conveyor_id": None,
+                "part_id": None,
+                "source_pi": None,
                 "trigger_value": None,
                 "threshold": None,
-                "event_time": None,
             })
         else:
-            # last_event may be timezone-aware; compare safely by converting to string if needed
-            # We'll compute staleness in SQL to avoid tz issues
-            cur.execute(
-                f"""
-                SELECT EXTRACT(EPOCH FROM (NOW() - MAX(event_time))) AS seconds_stale
-                FROM "{schema}".raw_conveyor
-                """
-            )
-            seconds_stale = cur.fetchone()["seconds_stale"] or 0
-
-            if seconds_stale > conveyor_stale_seconds:
+            if float(seconds_stale) > float(conveyor_stale_seconds):
                 active_alerts.append({
                     "type": "conveyor_stale",
                     "severity": "warning",
                     "title": "Conveyor events stopped",
                     "message": f"No conveyor events in the last {int(seconds_stale)} seconds.",
                     "source": "raw_conveyor",
+                    "event_time": str(latest["event_time"]) if latest else None,
+                    "conveyor_id": latest["conveyor_id"] if latest else None,
+                    "part_id": latest["part_id"] if latest else None,
+                    "source_pi": latest["source_pi"] if latest else None,
                     "trigger_value": float(seconds_stale),
                     "threshold": float(conveyor_stale_seconds),
-                    "event_time": str(last_event),
                 })
 
-        # 2) Conveyor slow: avg duration too high in last window
+        # 2) Conveyor slow: find "worst" conveyor in the lookback window
         cur.execute(
             f"""
             SELECT
+              conveyor_id,
+              source_pi,
               AVG(duration_sec) AS avg_duration,
               COUNT(*) AS n
             FROM "{schema}".raw_conveyor
             WHERE event_time >= NOW() - (%s || ' minutes')::interval
-            """
-            , (window_minutes,)
+            GROUP BY conveyor_id, source_pi
+            HAVING COUNT(*) >= 5
+            ORDER BY AVG(duration_sec) DESC
+            LIMIT 1
+            """,
+            (window_minutes,)
         )
-        row = cur.fetchone()
-        avg_duration = row["avg_duration"]
-        n = row["n"] or 0
-
-        if avg_duration is not None and n >= 5 and float(avg_duration) > conveyor_slow_duration:
-            active_alerts.append({
-                "type": "conveyor_slow",
-                "severity": "warning",
-                "title": "Conveyor running slow",
-                "message": f"Avg duration_sec over last {window_minutes} min is {float(avg_duration):.2f}s (n={n}).",
-                "source": "raw_conveyor",
-                "trigger_value": float(avg_duration),
-                "threshold": float(conveyor_slow_duration),
-                "event_time": None,
-            })
+        worst = cur.fetchone()
+        if worst and worst["avg_duration"] is not None:
+            avg_d = float(worst["avg_duration"])
+            if avg_d > float(conveyor_slow_duration):
+                active_alerts.append({
+                    "type": "conveyor_slow",
+                    "severity": "warning",
+                    "title": "Conveyor running slow",
+                    "message": f'Conveyor {worst["conveyor_id"]} avg duration {avg_d:.2f}s in last {window_minutes} min (n={worst["n"]}).',
+                    "source": "raw_conveyor",
+                    "event_time": None,
+                    "conveyor_id": worst["conveyor_id"],
+                    "part_id": None,
+                    "source_pi": worst["source_pi"],
+                    "trigger_value": avg_d,
+                    "threshold": float(conveyor_slow_duration),
+                })
 
         cur.close()
         conn.close()
-
         return {"alerts": active_alerts, "count": len(active_alerts)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
