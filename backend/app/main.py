@@ -172,7 +172,7 @@ def kpis(schema: str = Query(default=DB_SCHEMA_DEFAULT)):
               (SELECT COUNT(*) FROM "{schema}".raw_robot_cycles) AS robot_cycles,
               (SELECT COUNT(*) FROM "{schema}".raw_inspection) AS inspections,
               (SELECT COUNT(*) FROM "{schema}".raw_conveyor) AS conveyor_events,
-              (SELECT COUNT(*) FROM "{schema}".raw_bin_events) AS bin_events
+              (SELECT COUNT(*) FROM "{schema}".raw_bin_events) AS bin_events,
               (SELECT COUNT(*) FROM "{schema}".raw_shipments) AS shipments
             """
         )

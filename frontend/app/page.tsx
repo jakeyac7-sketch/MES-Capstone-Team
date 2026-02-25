@@ -15,37 +15,140 @@ type AlertItem = {
   trigger_value?: number | null;
   threshold?: number | null;
   event_time?: string | null;
-
-  // identifiers for cross-component interaction + highlighting
   conveyor_id?: string | number | null;
   part_id?: string | number | null;
   source_pi?: string | null;
 };
 
+// ─── MES Knowledge Base ─────────────────────────────────────────────────────
+// Each alert type maps to an MES module, explanation, and corrective steps.
+// Edit these to match your actual system's terminology and SOPs.
+const MES_ALERT_KNOWLEDGE: Record<
+  string,
+  {
+    module: string;
+    moduleColor: string;
+    whatItMeans: string;
+    steps: string[];
+    escalate?: string;
+  }
+> = {
+  conveyor_no_data: {
+    module: "Production Monitoring",
+    moduleColor: "#ef4444",
+    whatItMeans:
+      "The MES Production Monitoring module has detected that the raw_conveyor table contains zero records. This means the conveyor simulators have either not started, lost their database connection, or crashed entirely. In a real facility, this would trigger an immediate line-stop review.",
+    steps: [
+      "Verify all 4 simulator processes are running (check your terminal / process manager).",
+      "Confirm the feeder simulator is publishing events to the database.",
+      "Check PostgreSQL connection credentials in your .env file.",
+      "Restart the conveyor simulator and wait one polling cycle (≤30 s) for data to appear.",
+      "If the issue persists, escalate to the Controls Engineer on shift.",
+    ],
+    escalate: "Controls Engineer / Shift Supervisor",
+  },
+  conveyor_stale: {
+    module: "Production Monitoring",
+    moduleColor: "#f59e0b",
+    whatItMeans:
+      "The MES has not received a new conveyor event within the configured staleness window. Data was flowing previously but has now stopped. This typically indicates a mid-run crash, a network partition, or a queue backup that is preventing new events from being written.",
+    steps: [
+      "Check the timestamp shown on the alert — confirm how long ago the last event arrived.",
+      "SSH or connect to the Raspberry Pi / simulator host and verify the process is alive.",
+      "Inspect application logs for crash stack traces or connection refused errors.",
+      "Manually trigger one test event from the simulator to confirm the pipeline is healthy.",
+      "Resume normal operation once events begin appearing and staleness clears.",
+    ],
+    escalate: "Controls Engineer",
+  },
+  conveyor_slow: {
+    module: "Performance Analysis",
+    moduleColor: "#f59e0b",
+    whatItMeans:
+      "The MES Performance Analysis module has calculated that average conveyor part duration is exceeding the configured threshold over the monitoring window. In a Jackson network model, elevated service times at one node propagate upstream as queue buildup — this is an early-warning indicator of a bottleneck forming.",
+    steps: [
+      "Note which conveyor_id is flagged — focus investigation there first.",
+      "Review recent raw_conveyor rows for that conveyor: look for unusually high duration_sec outliers.",
+      "Check if speed is lower than nominal — a speed drop causes duration inflation.",
+      "In the simulation, verify the stochastic parameters for that node haven't drifted.",
+      "If this is a real system: inspect the physical belt for mechanical resistance or sensor drift.",
+      "Monitor for 2–3 more polling cycles; if avg_duration drops below threshold, alert will self-clear.",
+    ],
+    escalate: "Process Engineer",
+  },
+  inspection_fail_rate: {
+    module: "Quality Management",
+    moduleColor: "#8b5cf6",
+    whatItMeans:
+      "The MES Quality Management module has detected an elevated part rejection rate from the inspection station. This may indicate sensor miscalibration, upstream process drift, or a batch of non-conforming raw material entering the line.",
+    steps: [
+      "Pull the last 50 inspection records from the Inspection tab and filter for failed parts.",
+      "Group failures by source_pi to determine if rejections are concentrated at one input node.",
+      "Cross-reference part_ids with the Queue tab to trace back to originating robot cycle.",
+      "Recalibrate inspection thresholds if false-positive rate is suspected.",
+      "Flag affected part_ids for quarantine or re-inspection.",
+    ],
+    escalate: "Quality Engineer",
+  },
+  robot_cycle_long: {
+    module: "Equipment Monitoring",
+    moduleColor: "#3b82f6",
+    whatItMeans:
+      "The MES Equipment Monitoring module is reporting that robot cycle times have exceeded the expected range. Long cycle times reduce throughput and, in a Jackson network, increase queue depth at downstream nodes.",
+    steps: [
+      "Open the Robot Cycles tab and sort by cycle duration descending.",
+      "Identify whether slowdowns are concentrated in pick, transfer, or place phases.",
+      "Check for collisions or path replanning events in the robot controller logs.",
+      "Verify no upstream parts are being held waiting (check Queue tab, stage = in_transfer).",
+      "If simulation: confirm the stochastic service time distribution parameters are correct.",
+    ],
+    escalate: "Robotics Technician",
+  },
+};
+
+function getAlertKnowledge(type: string) {
+  return (
+    MES_ALERT_KNOWLEDGE[type] ?? {
+      module: "General MES Monitoring",
+      moduleColor: "#64748b",
+      whatItMeans:
+        "The MES has flagged an anomaly that does not match a pre-defined alert type. Review the raw data associated with this alert and compare against expected operating parameters.",
+      steps: [
+        "Review the alert details and identify which data source is affected.",
+        "Navigate to the relevant data tab and apply filters using the identifiers shown.",
+        "Compare current values against historical baselines.",
+        "Determine if this is a one-time anomaly or a recurring pattern.",
+        "Document findings and escalate if the issue cannot be resolved at operator level.",
+      ],
+      escalate: "Shift Supervisor",
+    }
+  );
+}
+
+// ─── Component ───────────────────────────────────────────────────────────────
+
 export default function Home() {
-  // --- core UI state
   const [tab, setTab] = useState<TabKey>("queue");
   const [kpis, setKpis] = useState<Record<string, any> | null>(null);
   const [rows, setRows] = useState<Record<string, any>[]>([]);
   const [alerts, setAlerts] = useState<AlertItem[]>([]);
+  const [acknowledgedAlerts, setAcknowledgedAlerts] = useState<Set<string>>(new Set());
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
 
-  // --- filters (cross-component)
   const [stage, setStage] = useState<string>("queued");
   const [filterPartId, setFilterPartId] = useState<string>("");
   const [filterConveyorId, setFilterConveyorId] = useState<string>("");
   const [filterSourcePi, setFilterSourcePi] = useState<string>("");
 
-  // --- sticky control bar options
   const [paused, setPaused] = useState<boolean>(false);
   const [refreshMs, setRefreshMs] = useState<number>(5000);
   const [tightMonitoring, setTightMonitoring] = useState<boolean>(false);
 
-  // --- details drawer
   const [selectedRow, setSelectedRow] = useState<Record<string, any> | null>(null);
+  const [resolveAlert, setResolveAlert] = useState<AlertItem | null>(null);
+  const [completedSteps, setCompletedSteps] = useState<Set<number>>(new Set());
 
-  // --- scrolling to matches
   const tableWrapRef = useRef<HTMLDivElement | null>(null);
 
   const tabs = useMemo(
@@ -60,7 +163,10 @@ export default function Home() {
     []
   );
 
-  // --- endpoints you already have (from prior steps)
+  function alertKey(a: AlertItem) {
+    return `${a.type}__${a.conveyor_id ?? ""}__${a.part_id ?? ""}__${a.source_pi ?? ""}`;
+  }
+
   function endpointForData(t: TabKey) {
     if (t === "queue") return `${API_BASE}/queue?stage=${encodeURIComponent(stage)}&limit=200`;
     if (t === "robot") return `${API_BASE}/robot-cycles?limit=200`;
@@ -71,25 +177,21 @@ export default function Home() {
   }
 
   function endpointForAlerts() {
-    // Tighten monitoring button simply changes thresholds (no DB changes needed)
     const stale = tightMonitoring ? 5 : 30;
     const slow = tightMonitoring ? 2.0 : 3.0;
     const windowMin = tightMonitoring ? 1 : 2;
     return `${API_BASE}/alerts?conveyor_stale_seconds=${stale}&conveyor_slow_duration=${slow}&window_minutes=${windowMin}`;
   }
 
-  // --- Load data + alerts + kpis
   async function load() {
     try {
       setLoading(true);
       setError(null);
-
       const [kRes, aRes, dRes] = await Promise.all([
         fetch(`${API_BASE}/kpis`),
         fetch(endpointForAlerts()),
         fetch(endpointForData(tab)),
       ]);
-
       if (!kRes.ok) throw new Error(`kpis failed: ${kRes.status}`);
       if (!aRes.ok) throw new Error(`alerts failed: ${aRes.status}`);
       if (!dRes.ok) throw new Error(`data failed: ${dRes.status}`);
@@ -110,29 +212,23 @@ export default function Home() {
     }
   }
 
-  useEffect(() => {
-    load();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tab, stage, tightMonitoring]);
+  useEffect(() => { load(); }, [tab, stage, tightMonitoring]);
 
   useEffect(() => {
     if (paused) return;
     const t = setInterval(() => load(), refreshMs);
     return () => clearInterval(t);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [paused, refreshMs, tab, stage, tightMonitoring]);
 
-  // --- derived: system status
-  const criticalCount = alerts.filter((a) => a.severity === "critical").length;
-  const warningCount = alerts.filter((a) => a.severity === "warning").length;
+  const visibleAlerts = alerts.filter((a) => !acknowledgedAlerts.has(alertKey(a)));
+  const criticalCount = visibleAlerts.filter((a) => a.severity === "critical").length;
+  const warningCount = visibleAlerts.filter((a) => a.severity === "warning").length;
   const systemStatus = criticalCount > 0 ? "critical" : warningCount > 0 ? "warning" : "ok";
 
-  // --- filtered rows in UI (no backend changes)
   const filteredRows = useMemo(() => {
     const p = filterPartId.trim();
     const c = filterConveyorId.trim();
     const s = filterSourcePi.trim().toLowerCase();
-
     return rows.filter((r) => {
       const partOk = !p || String(r.part_id ?? "").includes(p);
       const convOk = !c || String(r.conveyor_id ?? "").includes(c);
@@ -147,43 +243,38 @@ export default function Home() {
     return Object.keys(base[0]);
   }, [filteredRows, rows]);
 
-  // --- highlight: does a row match any active alert?
   function rowMatchesAlert(r: Record<string, any>) {
-    if (!alerts.length) return false;
+    if (!visibleAlerts.length) return false;
     const rowPart = r.part_id != null ? String(r.part_id) : "";
     const rowConv = r.conveyor_id != null ? String(r.conveyor_id) : "";
     const rowSrc = r.source_pi != null ? String(r.source_pi) : "";
-
-    return alerts.some((a) => {
+    return visibleAlerts.some((a) => {
       const aPart = a.part_id != null ? String(a.part_id) : "";
       const aConv = a.conveyor_id != null ? String(a.conveyor_id) : "";
       const aSrc = a.source_pi != null ? String(a.source_pi) : "";
-      // match any identifier present
-      const partMatch = aPart && rowPart && rowPart === aPart;
-      const convMatch = aConv && rowConv && rowConv === aConv;
-      const srcMatch = aSrc && rowSrc && rowSrc === aSrc;
-      return partMatch || convMatch || srcMatch;
+      return (aPart && rowPart === aPart) || (aConv && rowConv === aConv) || (aSrc && rowSrc === aSrc);
     });
   }
 
-  // --- cross-component: click alert -> switch tab & apply filters
   function onClickAlert(a: AlertItem) {
-    // Heuristic: conveyor alerts -> conveyor tab
-    if (a.source === "raw_conveyor" || a.type.startsWith("conveyor")) {
-      setTab("conveyor");
-    }
+    setResolveAlert(a);
+    setCompletedSteps(new Set());
+  }
 
+  function onClickAlertFilter(a: AlertItem) {
+    if (a.source === "raw_conveyor" || a.type.startsWith("conveyor")) setTab("conveyor");
     if (a.part_id != null) setFilterPartId(String(a.part_id));
     if (a.conveyor_id != null) setFilterConveyorId(String(a.conveyor_id));
     if (a.source_pi) setFilterSourcePi(String(a.source_pi));
-
-    // scroll table into view
-    setTimeout(() => {
-      tableWrapRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
-    }, 150);
+    setTimeout(() => tableWrapRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }), 150);
   }
 
-  // --- buttons: Focus on Conveyor (jump + use "best guess" conveyor id from alerts)
+  function acknowledgeAlert(a: AlertItem) {
+    setAcknowledgedAlerts((prev) => new Set([...prev, alertKey(a)]));
+    setResolveAlert(null);
+    setCompletedSteps(new Set());
+  }
+
   function focusOnConveyor() {
     setTab("conveyor");
     const best = alerts.find((a) => a.conveyor_id != null) || null;
@@ -198,74 +289,128 @@ export default function Home() {
     setFilterSourcePi("");
   }
 
+  function toggleStep(i: number) {
+    setCompletedSteps((prev) => {
+      const next = new Set(prev);
+      next.has(i) ? next.delete(i) : next.add(i);
+      return next;
+    });
+  }
+
+  const resolveKnowledge = resolveAlert ? getAlertKnowledge(resolveAlert.type) : null;
+  const resolveSteps = resolveKnowledge?.steps ?? [];
+  const allStepsComplete = resolveSteps.length > 0 && completedSteps.size === resolveSteps.length;
+
   return (
-    <div className="min-h-screen bg-slate-50 text-slate-900">
-      {/* Sticky Top Control Bar */}
-      <div className="sticky top-0 z-50 border-b border-slate-200 bg-white/95 backdrop-blur">
-        <div className="mx-auto max-w-6xl px-6 py-4 flex flex-wrap items-center gap-3">
-          <div className="min-w-[220px]">
-            <div className="text-lg font-semibold tracking-tight">MES Execution UI</div>
-            <div className="text-xs text-slate-500">API: {API_BASE}</div>
+    <div className="min-h-screen text-slate-100" style={{ background: "#0d1117", fontFamily: "'DM Mono', 'Fira Code', 'Courier New', monospace" }}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@300;400;500&family=Space+Grotesk:wght@400;500;600;700&display=swap');
+        .mes-header { font-family: 'Space Grotesk', sans-serif; }
+        .alert-pulse-critical { animation: pulse-red 2s infinite; }
+        .alert-pulse-warning { animation: pulse-amber 3s infinite; }
+        @keyframes pulse-red {
+          0%, 100% { box-shadow: 0 0 0 0 rgba(239,68,68,0.4); }
+          50% { box-shadow: 0 0 0 6px rgba(239,68,68,0); }
+        }
+        @keyframes pulse-amber {
+          0%, 100% { box-shadow: 0 0 0 0 rgba(245,158,11,0.3); }
+          50% { box-shadow: 0 0 0 6px rgba(245,158,11,0); }
+        }
+        .step-done { text-decoration: line-through; opacity: 0.5; }
+        .drawer-slide { animation: slideIn 0.2s ease-out; }
+        @keyframes slideIn { from { transform: translateX(100%); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
+        .modal-fade { animation: fadeUp 0.2s ease-out; }
+        @keyframes fadeUp { from { transform: translateY(16px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
+        .tab-active { border-bottom: 2px solid #38bdf8; color: #38bdf8; }
+        ::-webkit-scrollbar { width: 6px; height: 6px; }
+        ::-webkit-scrollbar-track { background: #161b22; }
+        ::-webkit-scrollbar-thumb { background: #30363d; border-radius: 3px; }
+        .kpi-card:hover { border-color: #38bdf8; transition: border-color 0.2s; }
+        .row-highlight { background: rgba(245,158,11,0.08) !important; border-left: 2px solid #f59e0b; }
+        .row-hover:hover { background: rgba(255,255,255,0.03) !important; }
+      `}</style>
+
+      {/* ── Top Bar ──────────────────────────────────────────────────────── */}
+      <div style={{ background: "#161b22", borderBottom: "1px solid #30363d" }} className="sticky top-0 z-50">
+        <div className="mx-auto max-w-7xl px-6 py-3 flex flex-wrap items-center gap-3">
+          {/* Brand */}
+          <div className="mr-4">
+            <div className="mes-header text-base font-bold tracking-wide" style={{ color: "#38bdf8", letterSpacing: "0.08em" }}>
+              MES CONTROL
+            </div>
+            <div className="text-xs" style={{ color: "#6e7681", fontFamily: "'DM Mono', monospace" }}>
+              {API_BASE}
+            </div>
           </div>
 
-          {/* System status */}
-          <div className="flex items-center gap-2 rounded-full border border-slate-200 bg-slate-50 px-3 py-1">
-            <StatusDot status={systemStatus} />
-            <span className="text-sm font-medium">
-              {systemStatus === "ok"
-                ? "SYSTEM NOMINAL"
+          {/* System status pill */}
+          <div
+            className={`flex items-center gap-2 px-3 py-1.5 rounded-sm border ${
+              systemStatus === "critical"
+                ? "border-red-500 bg-red-950 text-red-300 alert-pulse-critical"
                 : systemStatus === "warning"
-                ? "WARNING"
-                : "ATTENTION REQUIRED"}
+                ? "border-amber-500 bg-amber-950 text-amber-300"
+                : "border-emerald-700 bg-emerald-950 text-emerald-300"
+            }`}
+          >
+            <div
+              className={`h-2 w-2 rounded-full ${
+                systemStatus === "critical" ? "bg-red-500" : systemStatus === "warning" ? "bg-amber-400" : "bg-emerald-400"
+              }`}
+            />
+            <span className="mes-header text-xs font-semibold tracking-widest uppercase">
+              {systemStatus === "ok" ? "Nominal" : systemStatus === "warning" ? "Warning" : "Attention Required"}
             </span>
           </div>
 
-          {/* Alerts count */}
-          <div className="rounded-full border border-slate-200 bg-white px-3 py-1 text-sm">
+          {/* Alert count badge */}
+          <div className="px-3 py-1.5 rounded-sm border text-xs mes-header"
+            style={{ borderColor: "#30363d", background: "#21262d", color: "#8b949e" }}>
             Alerts{" "}
             <span
-              className={`ml-1 inline-flex items-center justify-center rounded-full px-2 py-0.5 text-xs font-semibold ${
-                alerts.length > 0 ? "bg-blue-600 text-white" : "bg-slate-200 text-slate-800"
+              className={`ml-1.5 inline-flex items-center justify-center rounded-sm px-1.5 py-0.5 text-xs font-bold ${
+                visibleAlerts.length > 0 ? "bg-red-600 text-white" : "text-slate-500"
               }`}
+              style={{ minWidth: "20px" }}
             >
-              {alerts.length}
+              {visibleAlerts.length}
             </span>
           </div>
 
-          {/* Buttons A-C (section 3) */}
+          {/* Controls */}
           <button
             onClick={() => setTightMonitoring((v) => !v)}
-            className={`rounded-lg px-3 py-2 text-sm font-medium border ${
+            className={`px-3 py-1.5 rounded-sm border text-xs mes-header font-medium transition-all ${
               tightMonitoring
-                ? "bg-blue-600 text-white border-blue-600"
-                : "bg-white text-slate-700 border-slate-200 hover:bg-slate-50"
+                ? "border-sky-500 bg-sky-900 text-sky-200"
+                : "border-slate-700 bg-transparent text-slate-400 hover:border-slate-500"
             }`}
-            title="Tighten Monitoring Mode changes alert thresholds for quick testing"
           >
-            Tighten Monitoring: {tightMonitoring ? "ON" : "OFF"}
+            TIGHT MON: {tightMonitoring ? "ON" : "OFF"}
           </button>
 
           <button
             onClick={focusOnConveyor}
-            className="rounded-lg bg-white text-slate-700 border border-slate-200 px-3 py-2 text-sm font-medium hover:bg-slate-50"
+            className="px-3 py-1.5 rounded-sm border text-xs mes-header font-medium text-slate-400 hover:text-sky-300 hover:border-sky-600 transition-all"
+            style={{ borderColor: "#30363d" }}
           >
-            Focus on Conveyor
+            FOCUS CONVEYOR
           </button>
 
           <button
             onClick={() => setPaused((v) => !v)}
-            className={`rounded-lg px-3 py-2 text-sm font-medium border ${
-              paused ? "bg-amber-100 border-amber-200 text-amber-900" : "bg-white border-slate-200 text-slate-700"
+            className={`px-3 py-1.5 rounded-sm border text-xs mes-header font-medium transition-all ${
+              paused ? "border-amber-500 bg-amber-950 text-amber-300" : "border-slate-700 text-slate-400 hover:border-slate-500"
             }`}
           >
-            Auto Refresh: {paused ? "Paused" : "On"}
+            {paused ? "⏸ PAUSED" : "▶ LIVE"}
           </button>
 
-          {/* Refresh interval */}
           <div className="ml-auto flex items-center gap-2">
-            <label className="text-xs text-slate-500">Refresh</label>
+            <span className="text-xs" style={{ color: "#6e7681" }}>POLL</span>
             <select
-              className="rounded-lg bg-white border border-slate-200 px-2 py-2 text-sm text-slate-700"
+              className="rounded-sm border px-2 py-1.5 text-xs"
+              style={{ background: "#21262d", borderColor: "#30363d", color: "#c9d1d9" }}
               value={refreshMs}
               onChange={(e) => setRefreshMs(Number(e.target.value))}
               disabled={paused}
@@ -278,86 +423,155 @@ export default function Home() {
 
             <button
               onClick={load}
-              className="rounded-lg bg-blue-600 text-white px-4 py-2 text-sm font-medium hover:bg-blue-700"
+              className="px-4 py-1.5 rounded-sm text-xs font-semibold mes-header transition-all"
+              style={{ background: "#1f6feb", color: "white" }}
             >
-              Refresh Now
+              SYNC
             </button>
           </div>
         </div>
       </div>
 
-      <main className="mx-auto max-w-6xl px-6 py-8">
-        {/* Alerts Panel */}
-        <div className="mb-6 rounded-2xl border border-slate-200 bg-white overflow-hidden">
-          <div className="px-5 py-4 border-b border-slate-200 flex items-center justify-between">
+      <main className="mx-auto max-w-7xl px-6 py-6">
+
+        {/* ── Active Alerts Panel ─────────────────────────────────────────── */}
+        <div className="mb-6 rounded-sm border overflow-hidden" style={{ borderColor: "#30363d", background: "#161b22" }}>
+          <div className="px-5 py-3 border-b flex items-center justify-between" style={{ borderColor: "#30363d" }}>
             <div>
-              <div className="font-semibold">Active Alerts</div>
-              <div className="text-xs text-slate-500">
-                Click an alert to focus the relevant table
-              </div>
+              <span className="mes-header font-semibold text-sm tracking-wider" style={{ color: "#c9d1d9" }}>
+                ACTIVE ALERTS
+              </span>
+              <span className="ml-2 text-xs" style={{ color: "#6e7681" }}>
+                — click any alert to open the MES resolution guide
+              </span>
             </div>
-            <div className="text-xs text-slate-500">{alerts.length} active</div>
+            <div className="text-xs" style={{ color: "#6e7681" }}>
+              {visibleAlerts.length} active · {acknowledgedAlerts.size} acknowledged
+            </div>
           </div>
 
-          {alerts.length === 0 && !loading && (
-            <div className="px-5 py-5 text-sm text-slate-600">
-              No active alerts right now.
+          {visibleAlerts.length === 0 && !loading && (
+            <div className="px-5 py-6 flex items-center gap-3">
+              <div className="h-2 w-2 rounded-full bg-emerald-400" />
+              <span className="text-sm" style={{ color: "#8b949e" }}>All systems nominal. No active alerts.</span>
             </div>
           )}
 
-          {alerts.length > 0 && (
-            <div className="divide-y divide-slate-200">
-              {alerts.map((a, idx) => (
-                <button
+          {visibleAlerts.length > 0 && (
+            <div>
+              {visibleAlerts.map((a, idx) => (
+                <div
                   key={idx}
-                  onClick={() => onClickAlert(a)}
-                  className="w-full text-left px-5 py-4 flex gap-4 hover:bg-slate-50"
+                  className="border-b flex gap-0"
+                  style={{ borderColor: "#21262d" }}
                 >
-                  <SeverityDot severity={a.severity} />
-                  <div className="flex-1">
-                    <div className="flex items-center justify-between gap-3">
-                      <div className="font-semibold">{a.title}</div>
-                      <span className="text-xs text-slate-500">{a.source || ""}</span>
-                    </div>
-                    <div className="text-sm text-slate-700 mt-1">{a.message}</div>
+                  {/* Severity bar */}
+                  <div
+                    className="w-1 flex-shrink-0"
+                    style={{
+                      background:
+                        a.severity === "critical" ? "#ef4444" : a.severity === "warning" ? "#f59e0b" : "#3b82f6",
+                    }}
+                  />
 
-                    {/* show identifiers for clarity */}
-                    <div className="mt-2 flex flex-wrap gap-2 text-xs text-slate-500">
-                      {a.source_pi && <Tag label={`pi: ${a.source_pi}`} />}
-                      {a.conveyor_id != null && <Tag label={`conveyor: ${a.conveyor_id}`} />}
-                      {a.part_id != null && <Tag label={`part: ${a.part_id}`} />}
-                    </div>
+                  <div className="flex-1 px-5 py-4">
+                    <div className="flex items-start justify-between gap-4">
+                      <div className="flex-1">
+                        {/* Module badge */}
+                        <div className="mb-1.5">
+                          <span
+                            className="inline-flex items-center rounded-sm px-2 py-0.5 text-xs font-semibold mes-header tracking-wider uppercase"
+                            style={{
+                              background: getAlertKnowledge(a.type).moduleColor + "22",
+                              color: getAlertKnowledge(a.type).moduleColor,
+                              border: `1px solid ${getAlertKnowledge(a.type).moduleColor}44`,
+                            }}
+                          >
+                            {getAlertKnowledge(a.type).module}
+                          </span>
+                          <span
+                            className="ml-2 text-xs uppercase tracking-widest font-semibold"
+                            style={{
+                              color:
+                                a.severity === "critical" ? "#ef4444" : a.severity === "warning" ? "#f59e0b" : "#3b82f6",
+                            }}
+                          >
+                            {a.severity}
+                          </span>
+                        </div>
 
-                    {a.event_time && (
-                      <div className="text-xs text-slate-500 mt-1">Last event: {a.event_time}</div>
-                    )}
+                        <div className="mes-header font-semibold text-sm mb-1" style={{ color: "#e6edf3" }}>
+                          {a.title}
+                        </div>
+                        <div className="text-xs mb-2" style={{ color: "#8b949e" }}>{a.message}</div>
+
+                        <div className="flex flex-wrap gap-2">
+                          {a.source_pi && <IdTag label={`pi: ${a.source_pi}`} />}
+                          {a.conveyor_id != null && <IdTag label={`conveyor: ${a.conveyor_id}`} />}
+                          {a.part_id != null && <IdTag label={`part: ${a.part_id}`} />}
+                          {a.trigger_value != null && (
+                            <IdTag label={`value: ${Number(a.trigger_value).toFixed(2)} / threshold: ${Number(a.threshold).toFixed(2)}`} dim />
+                          )}
+                          {a.event_time && <IdTag label={`last event: ${a.event_time}`} dim />}
+                        </div>
+                      </div>
+
+                      {/* Action buttons */}
+                      <div className="flex flex-col gap-2 flex-shrink-0">
+                        <button
+                          onClick={() => onClickAlert(a)}
+                          className="px-4 py-2 rounded-sm text-xs font-bold mes-header tracking-wider transition-all hover:opacity-90"
+                          style={{ background: "#1f6feb", color: "white" }}
+                        >
+                          RESOLVE →
+                        </button>
+                        <button
+                          onClick={() => onClickAlertFilter(a)}
+                          className="px-4 py-2 rounded-sm text-xs font-medium mes-header transition-all"
+                          style={{ background: "#21262d", color: "#8b949e", border: "1px solid #30363d" }}
+                        >
+                          FILTER DATA
+                        </button>
+                      </div>
+                    </div>
                   </div>
-                </button>
+                </div>
               ))}
             </div>
           )}
         </div>
 
-        {/* KPI cards */}
-        <div className="grid grid-cols-2 sm:grid-cols-3 gap-4 mb-6">
-          <Kpi title="Queued" value={kpis?.queued_parts} />
-          <Kpi title="Total Parts" value={kpis?.total_parts} />
-          <Kpi title="Robot Cycles" value={kpis?.robot_cycles} />
-          <Kpi title="Inspections" value={kpis?.inspections} />
-          <Kpi title="Conveyor Events" value={kpis?.conveyor_events} />
-          <Kpi title="Bin Events" value={kpis?.bin_events} />
+        {/* ── KPI Cards ───────────────────────────────────────────────────── */}
+        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3 mb-6">
+          {[
+            { label: "QUEUED", value: kpis?.queued_parts },
+            { label: "TOTAL PARTS", value: kpis?.total_parts },
+            { label: "ROBOT CYCLES", value: kpis?.robot_cycles },
+            { label: "INSPECTIONS", value: kpis?.inspections },
+            { label: "CONVEYOR EVT", value: kpis?.conveyor_events },
+            { label: "BIN EVENTS", value: kpis?.bin_events },
+          ].map((k) => (
+            <div
+              key={k.label}
+              className="kpi-card rounded-sm border p-4"
+              style={{ background: "#161b22", borderColor: "#30363d" }}
+            >
+              <div className="text-xs mes-header tracking-widest" style={{ color: "#6e7681" }}>{k.label}</div>
+              <div className="mt-2 text-2xl font-semibold mes-header" style={{ color: "#e6edf3" }}>
+                {k.value ?? "—"}
+              </div>
+            </div>
+          ))}
         </div>
 
-        {/* Tabs */}
-        <div className="flex flex-wrap gap-2 mb-4">
+        {/* ── Tabs ────────────────────────────────────────────────────────── */}
+        <div className="flex gap-0 border-b mb-4" style={{ borderColor: "#30363d" }}>
           {tabs.map((t) => (
             <button
               key={t.key}
               onClick={() => setTab(t.key)}
-              className={`rounded-lg px-3 py-2 text-sm border ${
-                tab === t.key
-                  ? "bg-blue-600 text-white border-blue-600"
-                  : "bg-white text-slate-700 border-slate-200 hover:bg-slate-50"
+              className={`px-4 py-2.5 text-xs mes-header font-medium tracking-wider uppercase transition-all ${
+                tab === t.key ? "tab-active" : "text-slate-500 hover:text-slate-300"
               }`}
             >
               {t.label}
@@ -365,11 +579,12 @@ export default function Home() {
           ))}
         </div>
 
-        {/* Filters (cross-component) */}
-        <div className="mb-4 grid grid-cols-1 sm:grid-cols-4 gap-3">
+        {/* ── Filters ─────────────────────────────────────────────────────── */}
+        <div className="mb-4 flex flex-wrap gap-2 items-center">
           {tab === "queue" && (
             <select
-              className="rounded-lg bg-white border border-slate-200 px-3 py-2 text-sm text-slate-700"
+              className="rounded-sm border px-3 py-2 text-xs"
+              style={{ background: "#21262d", borderColor: "#30363d", color: "#c9d1d9", fontFamily: "'DM Mono', monospace" }}
               value={stage}
               onChange={(e) => setStage(e.target.value)}
             >
@@ -381,120 +596,101 @@ export default function Home() {
               <option value="completed">completed</option>
             </select>
           )}
-
-          <input
-            className="rounded-lg bg-white border border-slate-200 px-3 py-2 text-sm"
-            placeholder="Filter part_id…"
-            value={filterPartId}
-            onChange={(e) => setFilterPartId(e.target.value)}
-          />
-          <input
-            className="rounded-lg bg-white border border-slate-200 px-3 py-2 text-sm"
-            placeholder="Filter conveyor_id…"
-            value={filterConveyorId}
-            onChange={(e) => setFilterConveyorId(e.target.value)}
-          />
-          <input
-            className="rounded-lg bg-white border border-slate-200 px-3 py-2 text-sm"
-            placeholder="Filter source_pi…"
-            value={filterSourcePi}
-            onChange={(e) => setFilterSourcePi(e.target.value)}
-          />
-
-          <div className="sm:col-span-4 flex gap-2">
-            <button
-              onClick={clearFilters}
-              className="rounded-lg bg-white text-slate-700 border border-slate-200 px-3 py-2 text-sm font-medium hover:bg-slate-50"
-            >
-              Clear Filters
-            </button>
-            <div className="text-xs text-slate-500 self-center">
-              Tip: click a table cell (part_id / conveyor_id / source_pi) to filter instantly.
-            </div>
-          </div>
+          {[
+            { placeholder: "part_id…", value: filterPartId, set: setFilterPartId },
+            { placeholder: "conveyor_id…", value: filterConveyorId, set: setFilterConveyorId },
+            { placeholder: "source_pi…", value: filterSourcePi, set: setFilterSourcePi },
+          ].map((f) => (
+            <input
+              key={f.placeholder}
+              className="rounded-sm border px-3 py-2 text-xs"
+              style={{ background: "#21262d", borderColor: "#30363d", color: "#c9d1d9", fontFamily: "'DM Mono', monospace", width: "150px" }}
+              placeholder={f.placeholder}
+              value={f.value}
+              onChange={(e) => f.set(e.target.value)}
+            />
+          ))}
+          <button
+            onClick={clearFilters}
+            className="px-3 py-2 rounded-sm border text-xs mes-header transition-all"
+            style={{ borderColor: "#30363d", color: "#6e7681", background: "transparent" }}
+          >
+            CLEAR
+          </button>
+          <span className="text-xs ml-2" style={{ color: "#484f58" }}>
+            Click any part_id / conveyor_id / source_pi cell to filter instantly
+          </span>
         </div>
 
         {error && (
-          <div className="mb-4 rounded-xl border border-red-200 bg-red-50 p-4 text-sm">
-            <div className="font-semibold text-red-700">Error</div>
-            <div className="text-red-700">{error}</div>
+          <div className="mb-4 rounded-sm border border-red-800 bg-red-950 p-4 text-xs">
+            <div className="mes-header font-semibold text-red-400 mb-1">CONNECTION ERROR</div>
+            <div style={{ color: "#fca5a5" }}>{error}</div>
           </div>
         )}
 
-        {/* Data Table */}
-        <div ref={tableWrapRef} className="rounded-2xl border border-slate-200 bg-white overflow-hidden">
-          <div className="px-5 py-4 border-b border-slate-200 flex items-center justify-between">
-            <div className="font-semibold">
-              {tabs.find((t) => t.key === tab)?.label}
-              {tab === "queue" && <span className="ml-2 text-xs text-slate-500">stage: <StageBadge stage={stage || "all"} /></span>}
+        {/* ── Data Table ──────────────────────────────────────────────────── */}
+        <div ref={tableWrapRef} className="rounded-sm border overflow-hidden" style={{ borderColor: "#30363d", background: "#161b22" }}>
+          <div className="px-5 py-3 border-b flex items-center justify-between" style={{ borderColor: "#30363d" }}>
+            <div className="mes-header font-semibold text-sm tracking-wider" style={{ color: "#c9d1d9" }}>
+              {tabs.find((t) => t.key === tab)?.label.toUpperCase()}
+              {tab === "queue" && (
+                <StageBadge stage={stage || "all"} />
+              )}
             </div>
-            <div className="text-xs text-slate-500">
-              {filteredRows.length} rows (filtered) / {rows.length} total
+            <div className="text-xs" style={{ color: "#6e7681" }}>
+              {filteredRows.length} / {rows.length} rows
             </div>
           </div>
 
           <div className="overflow-x-auto">
-            <table className="min-w-full text-sm">
-              <thead className="text-slate-600 bg-slate-50">
-                <tr className="border-b border-slate-200">
+            <table className="min-w-full text-xs" style={{ fontFamily: "'DM Mono', monospace" }}>
+              <thead style={{ background: "#0d1117", color: "#6e7681" }}>
+                <tr style={{ borderBottom: "1px solid #30363d" }}>
                   {columns.map((c) => (
-                    <th key={c} className="px-5 py-3 text-left font-medium whitespace-nowrap">
+                    <th key={c} className="px-5 py-3 text-left font-medium whitespace-nowrap tracking-wider uppercase">
                       {c}
                     </th>
                   ))}
                 </tr>
               </thead>
-
               <tbody>
                 {loading && (
                   <tr>
-                    <td colSpan={Math.max(columns.length, 1)} className="px-5 py-6 text-center text-slate-500">
-                      Loading…
+                    <td colSpan={Math.max(columns.length, 1)} className="px-5 py-8 text-center" style={{ color: "#484f58" }}>
+                      syncing…
                     </td>
                   </tr>
                 )}
-
                 {!loading && filteredRows.length === 0 && (
                   <tr>
-                    <td colSpan={Math.max(columns.length, 1)} className="px-5 py-6 text-center text-slate-500">
-                      No rows returned (try clearing filters).
+                    <td colSpan={Math.max(columns.length, 1)} className="px-5 py-8 text-center" style={{ color: "#484f58" }}>
+                      No rows (clear filters or check connection)
                     </td>
                   </tr>
                 )}
-
                 {!loading &&
                   filteredRows.map((r, idx) => {
                     const matched = rowMatchesAlert(r);
                     return (
                       <tr
                         key={idx}
-                        className={`border-b border-slate-100 hover:bg-slate-50 cursor-pointer ${
-                          matched ? "bg-amber-50" : ""
-                        }`}
+                        className={`row-hover cursor-pointer ${matched ? "row-highlight" : ""}`}
+                        style={{ borderBottom: "1px solid #21262d" }}
                         onClick={() => setSelectedRow(r)}
-                        title={matched ? "This row matches an active alert" : "Click for details"}
+                        title={matched ? "⚠ This row matches an active alert" : "Click for details"}
                       >
                         {columns.map((c) => (
                           <td
                             key={c}
-                            className="px-5 py-3 text-slate-800 whitespace-nowrap"
+                            className="px-5 py-3 whitespace-nowrap"
+                            style={{ color: matched ? "#fde68a" : "#c9d1d9" }}
                             onClick={(e) => {
-                              // Cross-component: click cell -> filter
-                              if (c === "part_id") {
-                                e.stopPropagation();
-                                setFilterPartId(String(r[c] ?? ""));
-                              }
-                              if (c === "conveyor_id") {
-                                e.stopPropagation();
-                                setFilterConveyorId(String(r[c] ?? ""));
-                              }
-                              if (c === "source_pi") {
-                                e.stopPropagation();
-                                setFilterSourcePi(String(r[c] ?? ""));
-                              }
+                              if (c === "part_id") { e.stopPropagation(); setFilterPartId(String(r[c] ?? "")); }
+                              if (c === "conveyor_id") { e.stopPropagation(); setFilterConveyorId(String(r[c] ?? "")); }
+                              if (c === "source_pi") { e.stopPropagation(); setFilterSourcePi(String(r[c] ?? "")); }
                             }}
                           >
-                            {/* Stage column badge if present */}
                             {c === "stage" ? <StageBadge stage={String(r[c] ?? "")} /> : formatCell(r[c])}
                           </td>
                         ))}
@@ -505,130 +701,299 @@ export default function Home() {
             </table>
           </div>
         </div>
+      </main>
 
-        {/* Details Drawer */}
-        {selectedRow && (
-          <div className="fixed inset-0 z-50">
-            <div className="absolute inset-0 bg-black/20" onClick={() => setSelectedRow(null)} />
-            <div className="absolute right-0 top-0 h-full w-full sm:w-[480px] bg-white border-l border-slate-200 shadow-xl">
-              <div className="p-5 border-b border-slate-200 flex items-center justify-between">
+      {/* ══════════════════════════════════════════════════════════════════════
+          ALERT RESOLVE MODAL — the main new feature
+      ══════════════════════════════════════════════════════════════════════ */}
+      {resolveAlert && resolveKnowledge && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+          {/* Backdrop */}
+          <div
+            className="absolute inset-0"
+            style={{ background: "rgba(0,0,0,0.75)", backdropFilter: "blur(4px)" }}
+            onClick={() => { setResolveAlert(null); setCompletedSteps(new Set()); }}
+          />
+
+          {/* Modal */}
+          <div
+            className="modal-fade relative w-full max-w-2xl max-h-[90vh] overflow-y-auto rounded-sm border"
+            style={{ background: "#161b22", borderColor: "#30363d", zIndex: 10 }}
+          >
+            {/* Modal header */}
+            <div
+              className="sticky top-0 px-6 pt-6 pb-4 border-b"
+              style={{ background: "#161b22", borderColor: "#30363d", zIndex: 1 }}
+            >
+              <div className="flex items-start justify-between gap-4">
                 <div>
-                  <div className="font-semibold">Row Details</div>
-                  <div className="text-xs text-slate-500">Click quick actions to filter</div>
+                  {/* MES Module badge */}
+                  <div className="mb-2">
+                    <span
+                      className="inline-flex items-center gap-1.5 rounded-sm px-2.5 py-1 text-xs font-bold mes-header tracking-widest uppercase"
+                      style={{
+                        background: resolveKnowledge.moduleColor + "22",
+                        color: resolveKnowledge.moduleColor,
+                        border: `1px solid ${resolveKnowledge.moduleColor}55`,
+                      }}
+                    >
+                      <svg width="10" height="10" viewBox="0 0 10 10" fill="currentColor">
+                        <rect width="4" height="4" />
+                        <rect x="6" width="4" height="4" />
+                        <rect y="6" width="4" height="4" />
+                        <rect x="6" y="6" width="4" height="4" />
+                      </svg>
+                      MES MODULE: {resolveKnowledge.module}
+                    </span>
+                    <span
+                      className="ml-2 text-xs uppercase tracking-widest font-bold"
+                      style={{
+                        color: resolveAlert.severity === "critical" ? "#ef4444" : resolveAlert.severity === "warning" ? "#f59e0b" : "#3b82f6",
+                      }}
+                    >
+                      {resolveAlert.severity}
+                    </span>
+                  </div>
+                  <h2 className="mes-header text-lg font-bold" style={{ color: "#e6edf3" }}>
+                    {resolveAlert.title}
+                  </h2>
+                  <p className="text-xs mt-1" style={{ color: "#8b949e" }}>{resolveAlert.message}</p>
                 </div>
                 <button
-                  onClick={() => setSelectedRow(null)}
-                  className="rounded-lg border border-slate-200 px-3 py-1 text-sm hover:bg-slate-50"
+                  onClick={() => { setResolveAlert(null); setCompletedSteps(new Set()); }}
+                  className="flex-shrink-0 px-3 py-1.5 rounded-sm border text-xs mes-header transition-all"
+                  style={{ borderColor: "#30363d", color: "#6e7681" }}
                 >
-                  Close
+                  ESC
                 </button>
               </div>
 
-              <div className="p-5 space-y-3">
-                <div className="flex flex-wrap gap-2">
-                  {"part_id" in selectedRow && selectedRow.part_id != null && (
-                    <button
-                      onClick={() => {
-                        setFilterPartId(String(selectedRow.part_id));
-                        setSelectedRow(null);
-                      }}
-                      className="rounded-lg bg-blue-600 text-white px-3 py-2 text-sm font-medium hover:bg-blue-700"
-                    >
-                      Filter by part_id
-                    </button>
-                  )}
-                  {"conveyor_id" in selectedRow && selectedRow.conveyor_id != null && (
-                    <button
-                      onClick={() => {
-                        setTab("conveyor");
-                        setFilterConveyorId(String(selectedRow.conveyor_id));
-                        setSelectedRow(null);
-                      }}
-                      className="rounded-lg bg-white border border-slate-200 px-3 py-2 text-sm font-medium hover:bg-slate-50"
-                    >
-                      Focus conveyor_id
-                    </button>
-                  )}
-                  {"source_pi" in selectedRow && selectedRow.source_pi != null && (
-                    <button
-                      onClick={() => {
-                        setFilterSourcePi(String(selectedRow.source_pi));
-                        setSelectedRow(null);
-                      }}
-                      className="rounded-lg bg-white border border-slate-200 px-3 py-2 text-sm font-medium hover:bg-slate-50"
-                    >
-                      Filter source_pi
-                    </button>
-                  )}
-                  <button
-                    onClick={() => {
-                      clearFilters();
-                      setSelectedRow(null);
-                    }}
-                    className="rounded-lg bg-white border border-slate-200 px-3 py-2 text-sm font-medium hover:bg-slate-50"
-                  >
-                    Clear filters
-                  </button>
-                </div>
+              {/* Alert identifiers */}
+              <div className="mt-3 flex flex-wrap gap-2">
+                {resolveAlert.source_pi && <IdTag label={`pi: ${resolveAlert.source_pi}`} />}
+                {resolveAlert.conveyor_id != null && <IdTag label={`conveyor: ${resolveAlert.conveyor_id}`} />}
+                {resolveAlert.part_id != null && <IdTag label={`part: ${resolveAlert.part_id}`} />}
+                {resolveAlert.trigger_value != null && (
+                  <IdTag
+                    label={`measured: ${Number(resolveAlert.trigger_value).toFixed(2)} · threshold: ${Number(resolveAlert.threshold).toFixed(2)}`}
+                    dim
+                  />
+                )}
+              </div>
+            </div>
 
-                <div className="rounded-xl border border-slate-200 overflow-hidden">
-                  <div className="bg-slate-50 px-4 py-2 text-xs font-medium text-slate-600">Fields</div>
-                  <div className="p-4 space-y-2 text-sm">
-                    {Object.entries(selectedRow).map(([k, v]) => (
-                      <div key={k} className="flex gap-3">
-                        <div className="w-36 text-slate-500">{k}</div>
-                        <div className="flex-1 text-slate-900 break-all">{formatCell(v)}</div>
+            {/* What it means */}
+            <div className="px-6 py-5 border-b" style={{ borderColor: "#21262d" }}>
+              <div className="text-xs font-bold mes-header tracking-widest uppercase mb-2" style={{ color: "#6e7681" }}>
+                What This Means (MES Context)
+              </div>
+              <p className="text-sm leading-relaxed" style={{ color: "#c9d1d9" }}>
+                {resolveKnowledge.whatItMeans}
+              </p>
+            </div>
+
+            {/* Corrective action steps */}
+            <div className="px-6 py-5 border-b" style={{ borderColor: "#21262d" }}>
+              <div className="flex items-center justify-between mb-3">
+                <div className="text-xs font-bold mes-header tracking-widest uppercase" style={{ color: "#6e7681" }}>
+                  Corrective Action Procedure
+                </div>
+                <div className="text-xs mes-header" style={{ color: "#484f58" }}>
+                  {completedSteps.size} / {resolveSteps.length} steps complete
+                </div>
+              </div>
+
+              {/* Progress bar */}
+              <div className="mb-4 h-1 rounded-full" style={{ background: "#21262d" }}>
+                <div
+                  className="h-1 rounded-full transition-all duration-300"
+                  style={{
+                    width: `${resolveSteps.length ? (completedSteps.size / resolveSteps.length) * 100 : 0}%`,
+                    background: allStepsComplete ? "#22c55e" : "#1f6feb",
+                  }}
+                />
+              </div>
+
+              <div className="space-y-2">
+                {resolveSteps.map((step, i) => {
+                  const done = completedSteps.has(i);
+                  return (
+                    <button
+                      key={i}
+                      onClick={() => toggleStep(i)}
+                      className="w-full text-left flex items-start gap-3 px-4 py-3 rounded-sm transition-all"
+                      style={{
+                        background: done ? "#0f2a1a" : "#0d1117",
+                        border: `1px solid ${done ? "#166534" : "#30363d"}`,
+                      }}
+                    >
+                      {/* Checkbox */}
+                      <div
+                        className="flex-shrink-0 mt-0.5 h-4 w-4 rounded-sm border flex items-center justify-center"
+                        style={{
+                          borderColor: done ? "#22c55e" : "#484f58",
+                          background: done ? "#22c55e" : "transparent",
+                        }}
+                      >
+                        {done && (
+                          <svg width="10" height="8" viewBox="0 0 10 8" fill="none">
+                            <path d="M1 4L3.5 6.5L9 1" stroke="white" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+                          </svg>
+                        )}
                       </div>
-                    ))}
-                  </div>
-                </div>
+                      <div className="flex gap-2 items-start">
+                        <span className="text-xs mes-header flex-shrink-0" style={{ color: done ? "#22c55e" : "#6e7681" }}>
+                          {String(i + 1).padStart(2, "0")}.
+                        </span>
+                        <span
+                          className={`text-sm ${done ? "step-done" : ""}`}
+                          style={{ color: done ? "#4b5563" : "#c9d1d9" }}
+                        >
+                          {step}
+                        </span>
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
 
-                <div className="text-xs text-slate-500">
-                  Highlighting rule: any row whose <span className="font-medium">part_id / conveyor_id / source_pi</span> matches an active alert is shaded.
+            {/* Escalation info */}
+            {resolveKnowledge.escalate && (
+              <div className="px-6 py-4 border-b" style={{ borderColor: "#21262d", background: "#0d1117" }}>
+                <div className="flex items-center gap-2 text-xs" style={{ color: "#6e7681" }}>
+                  <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
+                    <path d="M6 1L11 10H1L6 1Z" stroke="#f59e0b" strokeWidth="1.2" />
+                    <path d="M6 5V7M6 8.5V9" stroke="#f59e0b" strokeWidth="1.2" strokeLinecap="round" />
+                  </svg>
+                  <span>
+                    If unresolved after completing all steps, escalate to:{" "}
+                    <span className="mes-header font-semibold" style={{ color: "#f59e0b" }}>
+                      {resolveKnowledge.escalate}
+                    </span>
+                  </span>
+                </div>
+              </div>
+            )}
+
+            {/* Footer actions */}
+            <div className="px-6 py-4 flex items-center justify-between gap-3">
+              <button
+                onClick={() => onClickAlertFilter(resolveAlert)}
+                className="px-4 py-2 rounded-sm border text-xs mes-header font-medium transition-all"
+                style={{ borderColor: "#30363d", color: "#8b949e", background: "transparent" }}
+              >
+                VIEW IN DATA TABLE →
+              </button>
+
+              <button
+                onClick={() => acknowledgeAlert(resolveAlert)}
+                className={`px-6 py-2.5 rounded-sm text-xs font-bold mes-header tracking-wider transition-all ${
+                  allStepsComplete
+                    ? "bg-emerald-600 text-white hover:bg-emerald-500"
+                    : "border text-slate-500"
+                }`}
+                style={!allStepsComplete ? { borderColor: "#30363d", background: "transparent" } : {}}
+                title={!allStepsComplete ? "Complete all steps above to acknowledge" : "Mark alert as acknowledged"}
+              >
+                {allStepsComplete ? "✓ ACKNOWLEDGE & DISMISS" : `COMPLETE ${resolveSteps.length - completedSteps.size} REMAINING STEPS`}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Row Details Drawer (unchanged from before, restyled) ─────────── */}
+      {selectedRow && (
+        <div className="fixed inset-0 z-50">
+          <div className="absolute inset-0" style={{ background: "rgba(0,0,0,0.5)" }} onClick={() => setSelectedRow(null)} />
+          <div
+            className="drawer-slide absolute right-0 top-0 h-full w-full sm:w-96 border-l overflow-y-auto"
+            style={{ background: "#161b22", borderColor: "#30363d", zIndex: 10 }}
+          >
+            <div className="px-5 py-4 border-b flex items-center justify-between" style={{ borderColor: "#30363d" }}>
+              <div className="mes-header font-semibold text-sm tracking-wider" style={{ color: "#c9d1d9" }}>ROW DETAILS</div>
+              <button
+                onClick={() => setSelectedRow(null)}
+                className="px-3 py-1 rounded-sm border text-xs mes-header"
+                style={{ borderColor: "#30363d", color: "#6e7681" }}
+              >
+                CLOSE
+              </button>
+            </div>
+
+            <div className="p-5 space-y-3">
+              <div className="flex flex-wrap gap-2">
+                {"part_id" in selectedRow && selectedRow.part_id != null && (
+                  <button
+                    onClick={() => { setFilterPartId(String(selectedRow.part_id)); setSelectedRow(null); }}
+                    className="px-3 py-2 rounded-sm text-xs mes-header font-medium"
+                    style={{ background: "#1f6feb", color: "white" }}
+                  >
+                    Filter part_id
+                  </button>
+                )}
+                {"conveyor_id" in selectedRow && selectedRow.conveyor_id != null && (
+                  <button
+                    onClick={() => { setTab("conveyor"); setFilterConveyorId(String(selectedRow.conveyor_id)); setSelectedRow(null); }}
+                    className="px-3 py-2 rounded-sm border text-xs mes-header font-medium"
+                    style={{ borderColor: "#30363d", color: "#8b949e" }}
+                  >
+                    Focus conveyor_id
+                  </button>
+                )}
+                {"source_pi" in selectedRow && selectedRow.source_pi != null && (
+                  <button
+                    onClick={() => { setFilterSourcePi(String(selectedRow.source_pi)); setSelectedRow(null); }}
+                    className="px-3 py-2 rounded-sm border text-xs mes-header font-medium"
+                    style={{ borderColor: "#30363d", color: "#8b949e" }}
+                  >
+                    Filter source_pi
+                  </button>
+                )}
+                <button
+                  onClick={() => { clearFilters(); setSelectedRow(null); }}
+                  className="px-3 py-2 rounded-sm border text-xs mes-header font-medium"
+                  style={{ borderColor: "#30363d", color: "#6e7681" }}
+                >
+                  Clear
+                </button>
+              </div>
+
+              <div className="rounded-sm border overflow-hidden" style={{ borderColor: "#30363d" }}>
+                <div className="px-4 py-2 text-xs mes-header tracking-wider uppercase" style={{ background: "#0d1117", color: "#6e7681" }}>
+                  Fields
+                </div>
+                <div className="p-4 space-y-2">
+                  {Object.entries(selectedRow).map(([k, v]) => (
+                    <div key={k} className="flex gap-3 text-xs">
+                      <div className="w-32 flex-shrink-0" style={{ color: "#6e7681" }}>{k}</div>
+                      <div className="flex-1 break-all" style={{ color: "#c9d1d9" }}>{formatCell(v)}</div>
+                    </div>
+                  ))}
                 </div>
               </div>
             </div>
           </div>
-        )}
-      </main>
+        </div>
+      )}
     </div>
   );
 }
 
-function Kpi({ title, value }: { title: string; value: any }) {
+// ─── Sub-components ───────────────────────────────────────────────────────────
+
+function IdTag({ label, dim }: { label: string; dim?: boolean }) {
   return (
-    <div className="rounded-2xl border border-slate-200 bg-white p-5">
-      <div className="text-xs text-slate-500">{title}</div>
-      <div className="mt-2 text-2xl font-semibold tracking-tight text-slate-900">
-        {value ?? "—"}
-      </div>
-    </div>
-  );
-}
-
-function SeverityDot({ severity }: { severity: AlertItem["severity"] }) {
-  const cls =
-    severity === "critical"
-      ? "bg-red-500"
-      : severity === "warning"
-      ? "bg-amber-500"
-      : "bg-blue-500";
-  return <div className={`mt-1 h-3 w-3 rounded-full ${cls}`} />;
-}
-
-function StatusDot({ status }: { status: "ok" | "warning" | "critical" }) {
-  const cls =
-    status === "critical"
-      ? "bg-red-500"
-      : status === "warning"
-      ? "bg-amber-500"
-      : "bg-emerald-500";
-  return <div className={`h-3 w-3 rounded-full ${cls}`} />;
-}
-
-function Tag({ label }: { label: string }) {
-  return (
-    <span className="inline-flex items-center rounded-full border border-slate-200 bg-white px-2 py-0.5">
+    <span
+      className="inline-flex items-center rounded-sm px-2 py-0.5 text-xs"
+      style={{
+        background: dim ? "transparent" : "#21262d",
+        border: "1px solid #30363d",
+        color: dim ? "#484f58" : "#8b949e",
+        fontFamily: "'DM Mono', monospace",
+      }}
+    >
       {label}
     </span>
   );
@@ -636,28 +1001,26 @@ function Tag({ label }: { label: string }) {
 
 function StageBadge({ stage }: { stage: string }) {
   const s = (stage || "").toLowerCase();
-
-  const style =
-    s === "queued"
-      ? "bg-amber-100 text-amber-900 border-amber-200"
-      : s === "in_transfer"
-      ? "bg-blue-100 text-blue-900 border-blue-200"
-      : s === "picked"
-      ? "bg-indigo-100 text-indigo-900 border-indigo-200"
-      : s === "completed"
-      ? "bg-emerald-100 text-emerald-900 border-emerald-200"
-      : s === "at_ned"
-      ? "bg-sky-100 text-sky-900 border-sky-200"
-      : "bg-slate-100 text-slate-800 border-slate-200";
-
+  const cfg: Record<string, { bg: string; color: string; border: string }> = {
+    queued:      { bg: "#451a03", color: "#fbbf24", border: "#78350f" },
+    in_transfer: { bg: "#172554", color: "#93c5fd", border: "#1e3a8a" },
+    picked:      { bg: "#1e1b4b", color: "#a5b4fc", border: "#312e81" },
+    completed:   { bg: "#052e16", color: "#86efac", border: "#166534" },
+    at_ned:      { bg: "#0c1a2e", color: "#7dd3fc", border: "#0c4a6e" },
+    all:         { bg: "#1c1c1c", color: "#9ca3af", border: "#374151" },
+  };
+  const c = cfg[s] || { bg: "#1c1c1c", color: "#9ca3af", border: "#374151" };
   return (
-    <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-semibold ${style}`}>
+    <span
+      className="inline-flex items-center rounded-sm px-2 py-0.5 text-xs font-semibold mes-header tracking-wider ml-2"
+      style={{ background: c.bg, color: c.color, border: `1px solid ${c.border}` }}
+    >
       {stage || "—"}
     </span>
   );
 }
 
-function formatCell(v: any) {
+function formatCell(v: any): string {
   if (v === null || v === undefined) return "—";
   if (typeof v === "object") return JSON.stringify(v);
   return String(v);
